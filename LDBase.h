@@ -5,6 +5,9 @@
  */
 #include <stdio.h>
 #include <string.h>
+
+#define IDLES_BLOCK_SIZE 1024
+
 #pragma pack(1)
 /**
  * 偏移值
@@ -15,7 +18,7 @@ public:
 	void *pointer; // 对象的内存块
 	LDPos(unsigned long value)
 	{
-		value = value;
+		this->value = value;
 		pointer = NULL;
 	}
 	LDPos()
@@ -36,6 +39,7 @@ class LDSmallBlock{
 public:
 	enum{
 		STREAM = 0,
+		BASE = 1,
 	};
 	short index; // 编号
 	void* value; // 数值
@@ -110,11 +114,13 @@ public:
 		if (b)
 		{
 			b->write(o);
+			b->index = tag % IDLES_BLOCK_SIZE;
+			b->tag = LDSmallBlock::BASE;
 		}
 	}
-	LDPos getNowPos();
+	unsigned long getNowPos();
 };
-#define IDLES_BLOCK_SIZE 1024
+
 /**
  * 空闲大块标示
  **/
@@ -129,7 +135,7 @@ public:
 	{
 		memset(this,0,sizeof(*this));
 	}
-	LDPos getNowPos();
+	unsigned long  getNowPos();
 };
 /**
  * 当前写操作记录
@@ -140,8 +146,7 @@ public:
 		tag = 0;
 	}
 	LDPos bigBlock; // 当前大块信息
-	LDPos idleBlock; // 当前空闲块信息
-	LDPos oldBigBlock; // 上一次的块
+	LDPos oldBigBlock; // 上一次的大块
 	LDSmallBlock oldSmallBlock; // 更新的小块备份
 	int tag; // 当前操作标示
 	~LDBWriteSingal(){}
@@ -193,9 +198,13 @@ struct LDBHead{
 	{
 		memset(this,0,sizeof(*this));
 	}
-	LDPos getWriteSignalPos()
+	unsigned long getWriteSignalPos()
 	{
 		return sizeof(tag) + sizeof(idleBlockHead) + sizeof(bigBlock);
+	}
+	void clearSingal()
+	{
+		memset(&signal,0,sizeof(signal));
 	}
 };
 #pragma pack()
@@ -235,71 +244,44 @@ public:
 	 */
 	bool readBlock(void *content,unsigned int len);
 
-
 	/**
 	 * 移动到某个点
 	 */
-	void moveTo(const LDPos &pos);
+	void moveTo(const unsigned long &pos);
 
 	~LDBFile();
-
+	/**
+	 * DB 头 
+	 */
 	LDBHead head;
 	/**
 	 * 获取空闲位置
 	 */
-	LDPos getIdlePos()
-	{
-		LDBigIdlesBlock *nowBlock = &head.idleBlockHead;
-		while (nowBlock)
-		{
-			if (nowBlock->hadIdle)
-			{
-				for ( int i = 0; i < sizeof(nowBlock->value);i++)
-				{
-					char & tag = nowBlock->value[i];
-					for (int j = 0;j < 8;j++)
-					{
-						if (0 == (tag & (1 << j)))
-						{
-							unsigned long pos = (i * 8 + j) + sizeof(LDBHead);
-							return LDPos(pos);
-						}
-					}
-				}
-			}
-			nowBlock->hadIdle = false;
-			if (nowBlock->next.pointer)
-			{
-				nowBlock = (LDBigIdlesBlock *)nowBlock->next.pointer;
-				continue;
-			}
-			if (nowBlock->next.value != 0)
-			{
-				moveTo(nowBlock->getNowPos());
-				nowBlock = newNextIdleBlock(nowBlock);
-				readBlock(nowBlock,sizeof(LDBigIdlesBlock));
-				continue;
-			}
-			nowBlock = newNextIdleBlock(nowBlock);
-		}
-		return LDPos(0);
-	}
-	LDBigIdlesBlock * newNextIdleBlock(LDBigIdlesBlock *nowBlock)
-	{
-		LDBigIdlesBlock *newBlock = new LDBigIdlesBlock;
-		nowBlock->next = newBlock->now;
-		newBlock->pre = nowBlock->now;
-		newBlock->now.value = nowBlock->now.value + 1;
-		return newBlock;
-	}
-	void updateWirteSignal()
-	{
-		if (handle)
-		{
-			moveTo(head.getWriteSignalPos());
-			writeBlock(&head.signal,sizeof(head.signal));
-		}
-	}
+	LDPos getIdlePos();
+	/**
+	 * 重置空闲位置
+	 */
+	void resetIdle(unsigned long index);
+	/**
+	 * 获取空闲位置
+	 */
+	char* getIdleChar(unsigned long index);
+	/**
+	 * 设置空闲位置
+	 */
+	void setIdle(unsigned long  index);
+	/**
+	 * 创建下一个空闲位置
+	 */
+	LDBigIdlesBlock * newNextIdleBlock(LDBigIdlesBlock *nowBlock);
+	/**
+	 * 更新写信号
+	 */
+	void updateWirteSignal();
+	/**
+	 * 写空闲
+	 */
+	void writeIdles();
 private:
 	FILE *handle;
 };
@@ -318,7 +300,6 @@ public:
 	LDBStream(const char *fileName)
 	{
 		_file = new LDBFile(fileName);
-		head = &_file->head.bigBlock;
 	}
 	LDBStream(LDBStream &stream)
 	{
@@ -330,26 +311,40 @@ public:
 	bool open(bool withFormat = false)
 	{
 		if (!_file) return false;
-		return _file->open(withFormat);
+		if (_file->open(withFormat))
+		{
+			head = &_file->head.bigBlock;
+			return true;
+		}
+		return false;
 	}
+	/**
+	 * 写入基本数据
+	 */
 	template<typename type>
 	void write_base(type a,unsigned long tag)
 	{
 		LDBigBlock *nowBlock = head;
+		LDBigBlock *pre = head;
 		// 获取空闲子块
 		while (nowBlock && !nowBlock->checkTag(tag))
 		{
+			pre = nowBlock;
 			nowBlock = getNext(nowBlock);
 		}
 		if (!nowBlock)
 		{
-			nowBlock = newNextBlock(nowBlock);
+			nowBlock = newNextBlock(pre);
 			nowBlock->offset = tag / IDLES_BLOCK_SIZE;
 		}
 		if (nowBlock)
+		{
 			nowBlock->write(a,tag);
+		}
 	}
-	
+	/**
+	 * 写入对象
+	 */
 	template<typename object>
 	void write(object& o,unsigned long tag)
 	{
@@ -359,6 +354,9 @@ public:
 		ss & a;
 		write(ss,tag);
 	}
+	/**
+	 * 写入流数据
+	 **/
 	void write(LDBStream& ss,unsigned long tag);
 	/**
 	 * 根据当前块获取下一个块
@@ -370,59 +368,21 @@ public:
 	 */
 	LDBigBlock * newNextBlock(LDBigBlock *nowBlock);
 	LDBigBlock *head; // 当前块头
-
+	/**
+	 * 保存为tag的数据
+	 */
 	void save(int tag);
 
 	/**
 	 * 写入大块
 	 * 
 	 */
-	void writeBigBlock(LDBigBlock *block)
-	{
-		if (!_file) return;
-		LDBigBlock *nowBlock = block;
-		while (nowBlock)
-		{
-			_file->head.signal.start(LDBWriteSingal::WRITE_BIG);
-			_file->head.signal.oldBigBlock = nowBlock->getNowPos(); 
-			_file->head.signal.bigBlock = nowBlock->getNowPos(); 
-			_file->updateWirteSignal(); // 先写操作信号
-			_file->moveTo(nowBlock->getNowPos());
-			_file->writeBlock(nowBlock,sizeof(LDBigBlock));
-			/**
-			 * 回收老块
-			 */
-			/**
-			 * 写空闲块
-			 */
-			/**
-			 * 写大块
-			 */
-			_file->head.signal.close(LDBWriteSingal::WRITE_BIG);
-			_file->updateWirteSignal(); // 关闭写操作信号
-			nowBlock = (LDBigBlock *)nowBlock->next.pointer;
-		}
-	}
+	void writeBigBlock(LDBigBlock *block);
+	
 	/**
 	 * 写入小块
 	 */
-	void writeSmallBlock(LDSmallBlock *small)
-	{
-		/**
-		 * 先备份
-		 */
-		_file->head.signal.start(LDBWriteSingal::WRITE_SMALL); // 当前写操作
-		_file->moveTo(small->getNowPos());
-		_file->readBlock(&_file->head.signal.oldSmallBlock,sizeof(_file->head.signal.oldSmallBlock));// 将老的小块读出
-		if (_file->head.signal.oldSmallBlock.equal(*small))
-		{
-			_file->head.signal.close(LDBWriteSingal::WRITE_SMALL); // 关闭写小块操作
-			return;
-		}
-		_file->updateWirteSignal(); // 更新信号到文件
-		_file->moveTo(small->getNowPos());
-		_file->writeBlock(small,sizeof(LDSmallBlock)); // 更新小块
-	}
+	void writeSmallBlock(LDSmallBlock *small,const unsigned long &dest);
 private:
 	LDBFile *_file;
 };
